@@ -45,7 +45,17 @@ struct SBlockTimer
 
     std::chrono::high_resolution_clock::time_point m_start;
     const char* m_label;
+            for (float& f : m_miniBatchHiddenLayerBiasesDeltaCost)
+                f /= float(miniBatchIndex);
+            for (float& f : m_miniBatchOutputLayerBiasesDeltaCost)
+                f /= float(miniBatchIndex);
+            for (float& f : m_miniBatchHiddenLayerWeightsDeltaCost)
+                f /= float(miniBatchIndex);
+            for (float& f : m_miniBatchOutputLayerWeightsDeltaCost)
+                f /= float(miniBatchIndex);
+            
 };
+
 
 // ============================================================================================
 //                                    MNIST DATA LOADER
