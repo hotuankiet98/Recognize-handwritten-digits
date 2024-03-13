@@ -277,15 +277,7 @@ public:
                 // run the backward pass to get derivatives of the cost function
                 BackwardPass(pixels, imageLabel);
 
-                // add the current derivatives into the minibatch derivative arrays so we can average them at the end of the minibatch via division.
-                for (size_t i = 0; i < m_hiddenLayerBiasesDeltaCost.size(); ++i)
-                    m_miniBatchHiddenLayerBiasesDeltaCost[i] += m_hiddenLayerBiasesDeltaCost[i];
-                for (size_t i = 0; i < m_outputLayerBiasesDeltaCost.size(); ++i)
-                    m_miniBatchOutputLayerBiasesDeltaCost[i] += m_outputLayerBiasesDeltaCost[i];
-                for (size_t i = 0; i < m_hiddenLayerWeightsDeltaCost.size(); ++i)
-                    m_miniBatchHiddenLayerWeightsDeltaCost[i] += m_hiddenLayerWeightsDeltaCost[i];
-                for (size_t i = 0; i < m_outputLayerWeightsDeltaCost.size(); ++i)
-                    m_miniBatchOutputLayerWeightsDeltaCost[i] += m_outputLayerWeightsDeltaCost[i];
+
 
                 // note that we've added another item to the minibatch, and that we've consumed another training example
                 ++trainingIndex;
