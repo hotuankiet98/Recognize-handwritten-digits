@@ -9,16 +9,16 @@
 #include <algorithm>
 #include <chrono>
 #include <opencv2/opencv.hpp>
+#include <device_launch_parameters.h>
+#include <cuda_runtime.h>
+using namespace std;
 typedef uint32_t uint32;
 typedef uint16_t uint16;
 typedef uint8_t uint8;
-
-// Set to 1 to have it show error after each training and also writes it to an Error.csv file.
-// Slows down the process a bit (+~50% time on my machine)
 #define REPORT_ERROR_WHILE_TRAINING() 1 
 
 const size_t c_numInputNeurons = 784;
-const size_t c_numHiddenNeurons = 30;  // NOTE: setting this to 100 hidden neurons can give better results, but also can be worse other times.
+const size_t c_numHiddenNeurons = 30;
 const size_t c_numOutputNeurons = 10;
 
 const size_t c_trainingEpochs = 5;
@@ -28,22 +28,69 @@ const float c_learningRate = 3.0f;
 // ============================================================================================
 //                                     SBlockTimer
 // ============================================================================================
-// times a block of code
+#define CHECK(call)\
+{\
+    const cudaError_t error = call;\
+    if (error != cudaSuccess)\
+    {\
+        fprintf(stderr, "Error: %s:%d, ", __FILE__, __LINE__);\
+        fprintf(stderr, "code: %d, reason: %s\n", error,\
+                cudaGetErrorString(error));\
+        exit(EXIT_FAILURE);\
+    }\
+}
+
+struct GpuTimer
+{
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    GpuTimer()
+    {
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+    }
+
+    ~GpuTimer()
+    {
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+    }
+
+    void Start()
+    {
+        cudaEventRecord(start, 0);
+        cudaEventSynchronize(start);
+    }
+
+    void Stop()
+    {
+        cudaEventRecord(stop, 0);
+    }
+
+    float Elapsed()
+    {
+        float elapsed;
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&elapsed, start, stop);
+        return elapsed;
+    }
+};
 struct SBlockTimer
 {
     SBlockTimer(const char* label)
     {
-        m_start = std::chrono::high_resolution_clock::now();
+        m_start = chrono::high_resolution_clock::now();
         m_label = label;
     }
 
     ~SBlockTimer()
     {
-        std::chrono::duration<float> seconds = std::chrono::high_resolution_clock::now() - m_start;
+        chrono::duration<float> seconds = chrono::high_resolution_clock::now() - m_start;
         printf("%s%0.2f seconds\n", m_label, seconds.count());
     }
 
-    std::chrono::high_resolution_clock::time_point m_start;
+    chrono::high_resolution_clock::time_point m_start;
     const char* m_label;
 };
 
@@ -56,7 +103,96 @@ inline uint32 EndianSwap(uint32 a)
     return (a << 24) | ((a << 8) & 0x00ff0000) |
         ((a >> 8) & 0x0000ff00) | (a >> 24);
 }
+// Kernel CUDA để chuyển đổi từ uint8 sang float
+__global__ void convertUint8ToFloatCUDA(const uint8_t* pixels, float* pixelsFloat, size_t numPixels) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numPixels) {
+        pixelsFloat[idx] = static_cast<float>(pixels[idx]) / 255.0f;
+    }
+}
 
+// Hàm thực hiện chuyển đổi từ uint8 sang float trên GPU
+void convertToFloatCUDA(const uint8_t* pixels, float* pixelsFloat, size_t numPixels) {
+    const int blockSize = 256;
+    const int numBlocks = (numPixels + blockSize - 1) / blockSize;
+
+    uint8_t* d_pixels;
+    float* d_pixelsFloat;
+
+    CHECK(cudaMalloc(&d_pixels, numPixels * sizeof(uint8_t)));
+    CHECK(cudaMalloc(&d_pixelsFloat, numPixels * sizeof(float)));
+
+    CHECK(cudaMemcpy(d_pixels, pixels, numPixels * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+    convertUint8ToFloatCUDA << <numBlocks, blockSize >> > (d_pixels, d_pixelsFloat, numPixels);
+
+    CHECK(cudaMemcpy(pixelsFloat, d_pixelsFloat, numPixels * sizeof(float), cudaMemcpyDeviceToHost));
+
+    CHECK(cudaFree(d_pixels));
+    CHECK(cudaFree(d_pixelsFloat));
+}
+// Kernel CUDA để chuyển đổi từ uint8 sang float sử dụng shared memory
+__global__ void convertUint8ToFloatCUDAKernel2(const uint8_t* pixels, float* pixelsFloat, size_t numPixels) {
+    extern __shared__ float sharedPixels[];
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numPixels) {
+        sharedPixels[threadIdx.x] = static_cast<float>(pixels[idx]) / 255.0f;
+        __syncthreads(); // Đồng bộ hóa tất cả các luồng trong block để đảm bảo dữ liệu đã được sao chép vào shared memory
+        pixelsFloat[idx] = sharedPixels[threadIdx.x];
+    }
+}
+
+// Hàm thực hiện chuyển đổi từ uint8 sang float trên GPU
+void convertToFloatCUDAKernel2(const uint8_t* pixels, float* pixelsFloat, size_t numPixels) {
+     const int blockSize = 256;
+    const int numBlocks = (numPixels + blockSize - 1) / blockSize;
+
+    uint8_t* d_pixels;
+    float* d_pixelsFloat;
+
+    cudaMalloc(&d_pixels, numPixels * sizeof(uint8_t));
+    cudaMalloc(&d_pixelsFloat, numPixels * sizeof(float));
+
+    cudaMemcpy(d_pixels, pixels, numPixels * sizeof(uint8_t), cudaMemcpyHostToDevice);
+
+    convertUint8ToFloatCUDA << <numBlocks, blockSize, blockSize * sizeof(float) >> > (d_pixels, d_pixelsFloat, numPixels);
+
+    cudaMemcpy(pixelsFloat, d_pixelsFloat, numPixels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_pixels);
+    cudaFree(d_pixelsFloat);
+}
+
+__constant__ float kConversionFactor = 1.0f / 255.0f;
+
+__global__ void convertUint8ToFloatCUDAKernel3(const uint8_t* pixels, float* pixelsFloat, size_t numPixels) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numPixels) {
+        pixelsFloat[idx] = static_cast<float>(pixels[idx]) * kConversionFactor;
+    }
+}
+
+// Hàm thực hiện chuyển đổi từ uint8 sang float trên GPU
+void convertToFloatCUDAKernel3(const uint8_t* pixels, float* pixelsFloat, size_t numPixels) {
+    const int blockSize = 256;
+    const int numBlocks = (numPixels + blockSize - 1) / blockSize;
+
+    uint8_t* d_pixels;
+    float* d_pixelsFloat;
+
+    cudaMalloc(&d_pixels, numPixels * sizeof(uint8_t));
+    cudaMalloc(&d_pixelsFloat, numPixels * sizeof(float));
+
+    cudaMemcpy(d_pixels, pixels, numPixels * sizeof(uint8_t), cudaMemcpyHostToDevice);
+
+    convertUint8ToFloatCUDAKernel3 << <numBlocks, blockSize >> > (d_pixels, d_pixelsFloat, numPixels);
+
+    cudaMemcpy(pixelsFloat, d_pixelsFloat, numPixels * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_pixels);
+    cudaFree(d_pixelsFloat);
+}
 // MNIST data and file format description is from http://yann.lecun.com/exdb/mnist/
 class CMNISTData
 {
@@ -70,17 +206,11 @@ public:
         m_labels = nullptr;
         m_pixels = nullptr;
     }
-
     bool Load(bool training)
     {
         // set the expected image count
         m_imageCount = training ? 60000 : 10000;
-        // Randomize seed
-        srand(time(0));
 
-        // Calculate the desired count for each label
-        const int desiredCountPerLabel = 800;
-        int labelCounts[10] = { 0 };
         // read labels
         const char* labelsFileName = training ? "train-labels.idx1-ubyte" : "t10k-labels.idx1-ubyte";
         FILE* file = fopen(labelsFileName, "rb");
@@ -147,33 +277,303 @@ public:
 
         // convert the pixels from uint8 to float
         m_pixelsFloat.resize(28 * 28 * m_imageCount);
+        convertToFloatCUDA(m_pixels, m_pixelsFloat.data(), 28 * 28 * m_imageCount);
+
+        // success!
+        return true;
+    }
+    bool Loadkernel1(bool training)
+    {
+        // set the expected image count
+        m_imageCount = training ? 60000 : 10000;
+
+        // read labels
+        const char* labelsFileName = training ? "train-labels.idx1-ubyte" : "t10k-labels.idx1-ubyte";
+        FILE* file = fopen(labelsFileName, "rb");
+        if (!file)
+        {
+            printf("could not open %s for reading.\n", labelsFileName);
+            return false;
+        }
+        fseek(file, 0, SEEK_END);
+        long fileSize = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        m_labelData = new uint8[fileSize];
+        fread(m_labelData, fileSize, 1, file);
+        fclose(file);
+
+        // read images
+        const char* imagesFileName = training ? "train-images.idx3-ubyte" : "t10k-images.idx3-ubyte";
+        file = fopen(imagesFileName, "rb");
+        if (!file)
+        {
+            printf("could not open %s for reading.\n", imagesFileName);
+            return false;
+        }
+        fseek(file, 0, SEEK_END);
+        fileSize = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        m_imageData = new uint8[fileSize];
+        fread(m_imageData, fileSize, 1, file);
+        fclose(file);
+
+        // endian swap label file if needed, just first two uint32's.  The rest is uint8's.
+        uint32* data = (uint32*)m_labelData;
+        if (data[0] == 0x01080000)
+        {
+            data[0] = EndianSwap(data[0]);
+            data[1] = EndianSwap(data[1]);
+        }
+
+        // verify that the label file has the right header
+        if (data[0] != 2049 || data[1] != m_imageCount)
+        {
+            printf("Label data had unexpected header values.\n");
+            return false;
+        }
+        m_labels = (uint8*)&(data[2]);
+
+        // endian swap the image file if needed, just first 4 uint32's. The rest is uint8's.
+        data = (uint32*)m_imageData;
+        if (data[0] == 0x03080000)
+        {
+            data[0] = EndianSwap(data[0]);
+            data[1] = EndianSwap(data[1]);
+            data[2] = EndianSwap(data[2]);
+            data[3] = EndianSwap(data[3]);
+        }
+
+        // verify that the image file has the right header
+        if (data[0] != 2051 || data[1] != m_imageCount || data[2] != 28 || data[3] != 28)
+        {
+            printf("Label data had unexpected header values.\n");
+            return false;
+        }
+        int labelCounts[10] = { 0 };
+        const int desiredCountPerLabel = 1000;
+        m_pixels = (uint8*)&(data[4]);
+
+        // convert the pixels from uint8 to float
+        m_pixelsFloat.resize(28 * 28 * m_imageCount);
+        convertToFloatCUDA(m_pixels, m_pixelsFloat.data(), 28 * 28 * m_imageCount);
+       
         int selectedCount = 0;
         for (size_t i = 0; i < m_imageCount; ++i) {
             uint8 label = m_labels[i];
             if (labelCounts[label] < desiredCountPerLabel) {
                 ++labelCounts[label];
-                // Copy the pixel data
-                for (size_t j = 0; j < 28 * 28; ++j)
-                    m_pixelsFloat[selectedCount * 28 * 28 + j] = float(m_pixels[i * 28 * 28 + j]) / 255.0f;
                 ++selectedCount;
             }
         }
-        // Shuffle the selected samples
-        std::random_shuffle(m_pixelsFloat.begin(), m_pixelsFloat.begin() + selectedCount);
+        // Xáo trộn các mẫu đã chọn
+        random_shuffle(m_pixelsFloat.begin(), m_pixelsFloat.begin() + selectedCount);
 
-        // Set the image count to the number of selected samples
+        // Đặt số lượng hình ảnh cho số lượng mẫu đã chọn
         m_imageCount = selectedCount;
+        /*
         for (int i = 0; i < 10; ++i) {
             printf("Label %d: %d images\n", i, labelCounts[i]);
         }
+        */
         // success!
         return true;
     }
+    bool Loadkernel2(bool training)
+    {
+        // set the expected image count
+        m_imageCount = training ? 60000 : 10000;
 
+        // read labels
+        const char* labelsFileName = training ? "train-labels.idx1-ubyte" : "t10k-labels.idx1-ubyte";
+        FILE* file = fopen(labelsFileName, "rb");
+        if (!file)
+        {
+            printf("could not open %s for reading.\n", labelsFileName);
+            return false;
+        }
+        fseek(file, 0, SEEK_END);
+        long fileSize = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        m_labelData = new uint8[fileSize];
+        fread(m_labelData, fileSize, 1, file);
+        fclose(file);
+
+        // read images
+        const char* imagesFileName = training ? "train-images.idx3-ubyte" : "t10k-images.idx3-ubyte";
+        file = fopen(imagesFileName, "rb");
+        if (!file)
+        {
+            printf("could not open %s for reading.\n", imagesFileName);
+            return false;
+        }
+        fseek(file, 0, SEEK_END);
+        fileSize = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        m_imageData = new uint8[fileSize];
+        fread(m_imageData, fileSize, 1, file);
+        fclose(file);
+
+        // endian swap label file if needed, just first two uint32's.  The rest is uint8's.
+        uint32* data = (uint32*)m_labelData;
+        if (data[0] == 0x01080000)
+        {
+            data[0] = EndianSwap(data[0]);
+            data[1] = EndianSwap(data[1]);
+        }
+
+        // verify that the label file has the right header
+        if (data[0] != 2049 || data[1] != m_imageCount)
+        {
+            printf("Label data had unexpected header values.\n");
+            return false;
+        }
+        m_labels = (uint8*)&(data[2]);
+
+        // endian swap the image file if needed, just first 4 uint32's. The rest is uint8's.
+        data = (uint32*)m_imageData;
+        if (data[0] == 0x03080000)
+        {
+            data[0] = EndianSwap(data[0]);
+            data[1] = EndianSwap(data[1]);
+            data[2] = EndianSwap(data[2]);
+            data[3] = EndianSwap(data[3]);
+        }
+
+        // verify that the image file has the right header
+        if (data[0] != 2051 || data[1] != m_imageCount || data[2] != 28 || data[3] != 28)
+        {
+            printf("Label data had unexpected header values.\n");
+            return false;
+        }
+        int labelCounts[10] = { 0 };
+        const int desiredCountPerLabel = 1000;
+        m_pixels = (uint8*)&(data[4]);
+
+        // convert the pixels from uint8 to float
+        m_pixelsFloat.resize(28 * 28 * m_imageCount);
+        convertToFloatCUDAKernel2(m_pixels, m_pixelsFloat.data(), 28 * 28 * m_imageCount);
+
+        int selectedCount = 0;
+        for (size_t i = 0; i < m_imageCount; ++i) {
+            uint8 label = m_labels[i];
+            if (labelCounts[label] < desiredCountPerLabel) {
+                ++labelCounts[label];
+                ++selectedCount;
+            }
+        }
+        // Xáo trộn các mẫu đã chọn
+        random_shuffle(m_pixelsFloat.begin(), m_pixelsFloat.begin() + selectedCount);
+
+        // Đặt số lượng hình ảnh cho số lượng mẫu đã chọn
+        m_imageCount = selectedCount;
+        /*
+        for (int i = 0; i < 10; ++i) {
+            printf("Label %d: %d images\n", i, labelCounts[i]);
+        }
+        */
+        // success!
+        return true;
+    }
+    bool Loadkernel3(bool training)
+    {
+        // set the expected image count
+        m_imageCount = training ? 60000 : 10000;
+
+        // read labels
+        const char* labelsFileName = training ? "train-labels.idx1-ubyte" : "t10k-labels.idx1-ubyte";
+        FILE* file = fopen(labelsFileName, "rb");
+        if (!file)
+        {
+            printf("could not open %s for reading.\n", labelsFileName);
+            return false;
+        }
+        fseek(file, 0, SEEK_END);
+        long fileSize = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        m_labelData = new uint8[fileSize];
+        fread(m_labelData, fileSize, 1, file);
+        fclose(file);
+
+        // read images
+        const char* imagesFileName = training ? "train-images.idx3-ubyte" : "t10k-images.idx3-ubyte";
+        file = fopen(imagesFileName, "rb");
+        if (!file)
+        {
+            printf("could not open %s for reading.\n", imagesFileName);
+            return false;
+        }
+        fseek(file, 0, SEEK_END);
+        fileSize = ftell(file);
+        fseek(file, 0, SEEK_SET);
+        m_imageData = new uint8[fileSize];
+        fread(m_imageData, fileSize, 1, file);
+        fclose(file);
+
+        // endian swap label file if needed, just first two uint32's.  The rest is uint8's.
+        uint32* data = (uint32*)m_labelData;
+        if (data[0] == 0x01080000)
+        {
+            data[0] = EndianSwap(data[0]);
+            data[1] = EndianSwap(data[1]);
+        }
+
+        // verify that the label file has the right header
+        if (data[0] != 2049 || data[1] != m_imageCount)
+        {
+            printf("Label data had unexpected header values.\n");
+            return false;
+        }
+        m_labels = (uint8*)&(data[2]);
+
+        // endian swap the image file if needed, just first 4 uint32's. The rest is uint8's.
+        data = (uint32*)m_imageData;
+        if (data[0] == 0x03080000)
+        {
+            data[0] = EndianSwap(data[0]);
+            data[1] = EndianSwap(data[1]);
+            data[2] = EndianSwap(data[2]);
+            data[3] = EndianSwap(data[3]);
+        }
+
+        // verify that the image file has the right header
+        if (data[0] != 2051 || data[1] != m_imageCount || data[2] != 28 || data[3] != 28)
+        {
+            printf("Label data had unexpected header values.\n");
+            return false;
+        }
+        int labelCounts[10] = { 0 };
+        const int desiredCountPerLabel = 1000;
+        m_pixels = (uint8*)&(data[4]);
+
+        // convert the pixels from uint8 to float
+        m_pixelsFloat.resize(28 * 28 * m_imageCount);
+        convertToFloatCUDAKernel3(m_pixels, m_pixelsFloat.data(), 28 * 28 * m_imageCount);
+
+        int selectedCount = 0;
+        for (size_t i = 0; i < m_imageCount; ++i) {
+            uint8 label = m_labels[i];
+            if (labelCounts[label] < desiredCountPerLabel) {
+                ++labelCounts[label];
+                ++selectedCount;
+            }
+        }
+        // Xáo trộn các mẫu đã chọn
+        random_shuffle(m_pixelsFloat.begin(), m_pixelsFloat.begin() + selectedCount);
+
+        // Đặt số lượng hình ảnh cho số lượng mẫu đã chọn
+        m_imageCount = selectedCount;
+        /*
+        for (int i = 0; i < 10; ++i) {
+            printf("Label %d: %d images\n", i, labelCounts[i]);
+        }
+        */
+        // success!
+        return true;
+    }
     ~CMNISTData()
     {
-        delete[] m_labelData;
-        delete[] m_imageData;
+        delete[] static_cast<int*>(m_labelData);
+        delete[] static_cast<float*>(m_imageData);
     }
 
     size_t NumImages() const { return m_imageCount; }
@@ -194,7 +594,6 @@ private:
 
     std::vector<float> m_pixelsFloat;
 };
-
 // ============================================================================================
 //                                    NEURAL NETWORK
 // ============================================================================================
@@ -205,10 +604,10 @@ class CNeuralNetwork
 public:
     CNeuralNetwork()
     {
-        // initialize weights and biases to a gaussian distribution random number with mean 0, stddev 1.0
-        std::random_device rd;
-        std::mt19937 e2(rd());
-        std::normal_distribution<float> dist(0, 1);
+        // khởi tạo trọng số và độ lệch cho số ngẫu nhiên phân phối gaussian với giá trị trung bình 0, stddev 1.0
+        random_device rd;
+        mt19937 e2(rd());
+        normal_distribution<float> dist(0, 1);
 
         for (float& f : m_hiddenLayerBiases)
             f = dist(e2);
@@ -225,10 +624,11 @@ public:
 
     void Train(const CMNISTData& trainingData, size_t miniBatchSize, float learningRate)
     {
-        // shuffle the order of the training data for our mini batches
+        // xáo trộn thứ tự dữ liệu huấn luyện cho các lô nhỏ
 
         if (m_trainingOrder.size() != trainingData.NumImages())
         {
+            
             m_trainingOrder.resize(trainingData.NumImages());
             size_t index = 0;
             for (size_t& v : m_trainingOrder)
@@ -236,36 +636,37 @@ public:
                 v = index;
                 ++index;
             }
+            
         }
-        static std::random_device rd;
-        static std::mt19937 e2(rd());
-        std::shuffle(m_trainingOrder.begin(), m_trainingOrder.end(), e2);
+        static  random_device rd;
+        static  mt19937 e2(rd());
+        shuffle(m_trainingOrder.begin(), m_trainingOrder.end(), e2);
 
-        // process all minibatches until we are out of training examples
+        // xử lý tất cả các minibatch cho đến khi hết mẫu huấn luyện
         size_t trainingIndex = 0;
         while (trainingIndex < trainingData.NumImages())
         {
-            // Clear out minibatch derivatives.  We sum them up and then divide at the end of the minimatch
-            std::fill(m_miniBatchHiddenLayerBiasesDeltaCost.begin(), m_miniBatchHiddenLayerBiasesDeltaCost.end(), 0.0f);
-            std::fill(m_miniBatchOutputLayerBiasesDeltaCost.begin(), m_miniBatchOutputLayerBiasesDeltaCost.end(), 0.0f);
-            std::fill(m_miniBatchHiddenLayerWeightsDeltaCost.begin(), m_miniBatchHiddenLayerWeightsDeltaCost.end(), 0.0f);
-            std::fill(m_miniBatchOutputLayerWeightsDeltaCost.begin(), m_miniBatchOutputLayerWeightsDeltaCost.end(), 0.0f);
+            // Xóa các dẫn xuất minibatch. Chúng tôi tổng hợp lại rồi chia khi kết thúc trận đấu nhỏ
+            fill(m_miniBatchHiddenLayerBiasesDeltaCost.begin(), m_miniBatchHiddenLayerBiasesDeltaCost.end(), 0.0f);
+            fill(m_miniBatchOutputLayerBiasesDeltaCost.begin(), m_miniBatchOutputLayerBiasesDeltaCost.end(), 0.0f);
+            fill(m_miniBatchHiddenLayerWeightsDeltaCost.begin(), m_miniBatchHiddenLayerWeightsDeltaCost.end(), 0.0f);
+            fill(m_miniBatchOutputLayerWeightsDeltaCost.begin(), m_miniBatchOutputLayerWeightsDeltaCost.end(), 0.0f);
 
-            // process the minibatch
+            // xử lý minibatch
             size_t miniBatchIndex = 0;
             while (miniBatchIndex < miniBatchSize && trainingIndex < trainingData.NumImages())
             {
-                // get the training item
+                // lấy vật phẩm huấn luyện
                 uint8 imageLabel = 0;
                 const float* pixels = trainingData.GetImage(m_trainingOrder[trainingIndex], imageLabel);
 
-                // run the forward pass of the network
+                // chạy chuyển tiếp mạng
                 uint8 labelDetected = ForwardPass(pixels, imageLabel);
 
-                // run the backward pass to get derivatives of the cost function
+                // chạy ngược lại để lấy đạo hàm của hàm chi phí
                 BackwardPass(pixels, imageLabel);
 
-                // add the current derivatives into the minibatch derivative arrays so we can average them at the end of the minibatch via division.
+                // cộng các đạo hàm hiện tại vào mảng đạo hàm minibatch để có thể tính trung bình cộng của chúng ở cuối minibatch thông qua phép chia.
                 for (size_t i = 0; i < m_hiddenLayerBiasesDeltaCost.size(); ++i)
                     m_miniBatchHiddenLayerBiasesDeltaCost[i] += m_hiddenLayerBiasesDeltaCost[i];
                 for (size_t i = 0; i < m_outputLayerBiasesDeltaCost.size(); ++i)
@@ -275,28 +676,14 @@ public:
                 for (size_t i = 0; i < m_outputLayerWeightsDeltaCost.size(); ++i)
                     m_miniBatchOutputLayerWeightsDeltaCost[i] += m_outputLayerWeightsDeltaCost[i];
 
-                // note that we've added another item to the minibatch, and that we've consumed another training example
                 ++trainingIndex;
                 ++miniBatchIndex;
             }
 
-            // divide minibatch derivatives by how many items were in the minibatch, to get the average of the derivatives.
-            // NOTE: instead of doing this explicitly like in the commented code below, we'll do it implicitly
-            // by dividing the learning rate by miniBatchIndex.
-            /*
-            for (float& f : m_miniBatchHiddenLayerBiasesDeltaCost)
-                f /= float(miniBatchIndex);
-            for (float& f : m_miniBatchOutputLayerBiasesDeltaCost)
-                f /= float(miniBatchIndex);
-            for (float& f : m_miniBatchHiddenLayerWeightsDeltaCost)
-                f /= float(miniBatchIndex);
-            for (float& f : m_miniBatchOutputLayerWeightsDeltaCost)
-                f /= float(miniBatchIndex);
-            */
 
             float miniBatchLearningRate = learningRate / float(miniBatchIndex);
 
-            // apply training to biases and weights
+            // áp dụng huấn luyện cho độ lệch và trọng số
             for (size_t i = 0; i < m_hiddenLayerBiases.size(); ++i)
                 m_hiddenLayerBiases[i] -= m_miniBatchHiddenLayerBiasesDeltaCost[i] * miniBatchLearningRate;
             for (size_t i = 0; i < m_outputLayerBiases.size(); ++i)
@@ -308,10 +695,10 @@ public:
         }
     }
 
-    // This function evaluates the network for the given input pixels and returns the label it thinks it is from 0-9
+    // Hàm này đánh giá mạng cho các pixel đầu vào đã cho và trả về nhãn mà nó cho là từ 0-9
     uint8 ForwardPass(const float* pixels, uint8 correctLabel)
     {
-        // first do hidden layer
+        // đầu tiên làm lớp ẩn
         for (size_t neuronIndex = 0; neuronIndex < HIDDEN_NEURONS; ++neuronIndex)
         {
             float Z = m_hiddenLayerBiases[neuronIndex];
@@ -319,10 +706,10 @@ public:
             for (size_t inputIndex = 0; inputIndex < INPUTS; ++inputIndex)
                 Z += pixels[inputIndex] * m_hiddenLayerWeights[HiddenLayerWeightIndex(inputIndex, neuronIndex)];
 
-            m_hiddenLayerOutputs[neuronIndex] = 1.0f / (1.0f + std::exp(-Z));
+            m_hiddenLayerOutputs[neuronIndex] = 1.0f / (1.0f + exp(-Z));
         }
 
-        // then do output layer
+        // sau đó thực hiện lớp đầu ra
         for (size_t neuronIndex = 0; neuronIndex < OUTPUT_NEURONS; ++neuronIndex)
         {
             float Z = m_outputLayerBiases[neuronIndex];
@@ -330,12 +717,12 @@ public:
             for (size_t inputIndex = 0; inputIndex < HIDDEN_NEURONS; ++inputIndex)
                 Z += m_hiddenLayerOutputs[inputIndex] * m_outputLayerWeights[OutputLayerWeightIndex(inputIndex, neuronIndex)];
 
-            m_outputLayerOutputs[neuronIndex] = 1.0f / (1.0f + std::exp(-Z));
+            m_outputLayerOutputs[neuronIndex] = 1.0f / (1.0f + exp(-Z));
         }
 
-        // calculate error.
-        // this is the magnitude of the vector that is Desired - Actual.
-        // Commenting out because it's not needed.
+        // tính toán lỗi.
+        // Đây là độ lớn của vectơ Mong muốn - Thực tế.
+        // Không cần thiết.
         /*
         {
             error = 0.0f;
@@ -345,11 +732,11 @@ public:
                 float diff = (desiredOutput - m_outputLayerOutputs[neuronIndex]);
                 error += diff * diff;
             }
-            error = std::sqrt(error);
+            error =  sqrt(error);
         }
         */
 
-        // find the maximum value of the output layer and return that index as the label
+        // tìm giá trị lớn nhất của lớp đầu ra và trả về chỉ mục đó làm nhãn
         float maxOutput = m_outputLayerOutputs[0];
         uint8 maxLabel = 0;
         for (uint8 neuronIndex = 1; neuronIndex < OUTPUT_NEURONS; ++neuronIndex)
@@ -363,11 +750,11 @@ public:
         return maxLabel;
     }
 
-    // Functions to get weights/bias values. Used to make the JSON file.
-    const std::array<float, HIDDEN_NEURONS>& GetHiddenLayerBiases() const { return m_hiddenLayerBiases; }
-    const std::array<float, OUTPUT_NEURONS>& GetOutputLayerBiases() const { return m_outputLayerBiases; }
-    const std::array<float, INPUTS* HIDDEN_NEURONS>& GetHiddenLayerWeights() const { return m_hiddenLayerWeights; }
-    const std::array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>& GetOutputLayerWeights() const { return m_outputLayerWeights; }
+    // Hàm lấy giá trị trọng số/độ lệch. Được sử dụng để tạo tệp JSON.
+    const  array<float, HIDDEN_NEURONS>& GetHiddenLayerBiases() const { return m_hiddenLayerBiases; }
+    const  array<float, OUTPUT_NEURONS>& GetOutputLayerBiases() const { return m_outputLayerBiases; }
+    const  array<float, INPUTS* HIDDEN_NEURONS>& GetHiddenLayerWeights() const { return m_hiddenLayerWeights; }
+    const  array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>& GetOutputLayerWeights() const { return m_outputLayerWeights; }
 
 private:
 
@@ -381,16 +768,16 @@ private:
         return outputLayerNeuronIndex * HIDDEN_NEURONS + hiddenLayerNeuronIndex;
     }
 
-    // this function uses the neuron output values from the forward pass to backpropagate the error
-    // of the network to calculate the gradient needed for training.  It figures out what the error
-    // is by comparing the label it came up with to the label it should have come up with (correctLabel).
+    // hàm này sử dụng các giá trị đầu ra nơ-ron từ chuyển tiếp để truyền ngược lỗi
+    // của mạng để tính toán độ dốc cần thiết cho việc huấn luyện. Nó tìm ra lỗi gì
+    // bằng cách so sánh nhãn mà nó nghĩ ra với nhãn mà lẽ ra nó phải nghĩ ra ( CorrectLabel).
     void BackwardPass(const float* pixels, uint8 correctLabel)
     {
-        // since we are going backwards, do the output layer first
+        // vì đang quay ngược lại nên hãy thực hiện lớp đầu ra trước
         for (size_t neuronIndex = 0; neuronIndex < OUTPUT_NEURONS; ++neuronIndex)
         {
-            // calculate deltaCost/deltaBias for each output neuron.
-            // This is also the error for the neuron, and is the same value as deltaCost/deltaZ.
+            // tính deltaCost/deltaBias cho mỗi nơ ron đầu ra.
+            // Đây cũng là lỗi của nơ-ron và có cùng giá trị với deltaCost/deltaZ.
             //
             // deltaCost/deltaZ = deltaCost/deltaO * deltaO/deltaZ
             //
@@ -404,7 +791,7 @@ private:
 
             m_outputLayerBiasesDeltaCost[neuronIndex] = deltaCost_deltaO * deltaO_deltaZ;
 
-            // calculate deltaCost/deltaWeight for each weight going into the neuron
+            // tính deltaCost/deltaWeight cho mỗi trọng số đi vào nơ-ron
             //
             // deltaCost/deltaWeight = deltaCost/deltaZ * deltaCost/deltaWeight
             // deltaCost/deltaWeight = deltaCost/deltaBias * input
@@ -413,18 +800,18 @@ private:
                 m_outputLayerWeightsDeltaCost[OutputLayerWeightIndex(inputIndex, neuronIndex)] = m_outputLayerBiasesDeltaCost[neuronIndex] * m_hiddenLayerOutputs[inputIndex];
         }
 
-        // then do the hidden layer
+        // sau đó thực hiện lớp ẩn
         for (size_t neuronIndex = 0; neuronIndex < HIDDEN_NEURONS; ++neuronIndex)
         {
-            // calculate deltaCost/deltaBias for each hidden neuron.
-            // This is also the error for the neuron, and is the same value as deltaCost/deltaZ.
+            // tính deltaCost/deltaBias cho mỗi nơ-ron ẩn.
+            // Đây cũng là lỗi của nơ-ron và có cùng giá trị với deltaCost/deltaZ.
             //
             // deltaCost/deltaO =
             //   Sum for each output of this neuron:
             //     deltaCost/deltaDestinationZ * deltaDestinationZ/deltaSourceO
             //
-            // deltaCost/deltaDestinationZ is already calculated and lives in m_outputLayerBiasesDeltaCost[destinationNeuronIndex].
-            // deltaTargetZ/deltaSourceO is the value of the weight connecting the source and target neuron.
+            // deltaCost/deltaDestinationZ đã được tính toán và tồn tại trong m_outputLayerBiasesDeltaCost[destinationNeuronIndex].
+            // deltaTargetZ/deltaSourceO là giá trị trọng số kết nối nơron nguồn và nơron đích.
             //
             // deltaCost/deltaZ = deltaCost/deltaO * deltaO/deltaZ
             // deltaO/deltaZ = O * (1 - O)
@@ -435,7 +822,7 @@ private:
             float deltaO_deltaZ = m_hiddenLayerOutputs[neuronIndex] * (1.0f - m_hiddenLayerOutputs[neuronIndex]);
             m_hiddenLayerBiasesDeltaCost[neuronIndex] = deltaCost_deltaO * deltaO_deltaZ;
 
-            // calculate deltaCost/deltaWeight for each weight going into the neuron
+            // tính deltaCost/deltaWeight cho mỗi trọng số đi vào nơ-ron
             //
             // deltaCost/deltaWeight = deltaCost/deltaZ * deltaCost/deltaWeight
             // deltaCost/deltaWeight = deltaCost/deltaBias * input
@@ -447,40 +834,40 @@ private:
 
 private:
 
-    // biases and weights
-    std::array<float, HIDDEN_NEURONS>                 m_hiddenLayerBiases;
-    std::array<float, OUTPUT_NEURONS>                 m_outputLayerBiases;
+    // độ lệch và trọng số
+    array<float, HIDDEN_NEURONS>                 m_hiddenLayerBiases;
+    array<float, OUTPUT_NEURONS>                 m_outputLayerBiases;
 
-    std::array<float, INPUTS* HIDDEN_NEURONS>            m_hiddenLayerWeights;
-    std::array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>    m_outputLayerWeights;
+    array<float, INPUTS* HIDDEN_NEURONS>            m_hiddenLayerWeights;
+    array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>    m_outputLayerWeights;
 
-    // neuron activation values aka "O" values
-    std::array<float, HIDDEN_NEURONS>                 m_hiddenLayerOutputs;
-    std::array<float, OUTPUT_NEURONS>                 m_outputLayerOutputs;
+    // giá trị kích hoạt nơ-ron hay còn gọi là giá trị "O"
+    array<float, HIDDEN_NEURONS>                 m_hiddenLayerOutputs;
+    array<float, OUTPUT_NEURONS>                 m_outputLayerOutputs;
 
-    // derivatives of biases and weights for a single training example
-    std::array<float, HIDDEN_NEURONS>                 m_hiddenLayerBiasesDeltaCost;
-    std::array<float, OUTPUT_NEURONS>                 m_outputLayerBiasesDeltaCost;
+    // dẫn xuất của độ lệch và trọng số cho một ví dụ huấn luyện
+    array<float, HIDDEN_NEURONS>                 m_hiddenLayerBiasesDeltaCost;
+    array<float, OUTPUT_NEURONS>                 m_outputLayerBiasesDeltaCost;
 
-    std::array<float, INPUTS* HIDDEN_NEURONS>            m_hiddenLayerWeightsDeltaCost;
-    std::array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>    m_outputLayerWeightsDeltaCost;
+    array<float, INPUTS* HIDDEN_NEURONS>            m_hiddenLayerWeightsDeltaCost;
+    array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>    m_outputLayerWeightsDeltaCost;
 
-    // derivatives of biases and weights for the minibatch. Average of all items in minibatch.
-    std::array<float, HIDDEN_NEURONS>                 m_miniBatchHiddenLayerBiasesDeltaCost;
-    std::array<float, OUTPUT_NEURONS>                 m_miniBatchOutputLayerBiasesDeltaCost;
+    // dẫn xuất của độ lệch và trọng số cho minibatch. Trung bình của tất cả các mặt hàng trong minibatch.
+    array<float, HIDDEN_NEURONS>                 m_miniBatchHiddenLayerBiasesDeltaCost;
+    array<float, OUTPUT_NEURONS>                 m_miniBatchOutputLayerBiasesDeltaCost;
 
-    std::array<float, INPUTS* HIDDEN_NEURONS>            m_miniBatchHiddenLayerWeightsDeltaCost;
-    std::array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>    m_miniBatchOutputLayerWeightsDeltaCost;
+    array<float, INPUTS* HIDDEN_NEURONS>            m_miniBatchHiddenLayerWeightsDeltaCost;
+    array<float, HIDDEN_NEURONS* OUTPUT_NEURONS>    m_miniBatchOutputLayerWeightsDeltaCost;
 
-    // used for minibatch generation
-    std::vector<size_t>                                   m_trainingOrder;
+    // được sử dụng để tạo minibatch
+    vector<size_t>                                   m_trainingOrder;
 };
 
 // ============================================================================================
 //                                   DRIVER PROGRAM
 // ============================================================================================
 
-// training and test data
+// dữ liệu huấn luyện và kiểm tra
 CMNISTData g_trainingData;
 CMNISTData g_testData;
 
@@ -521,11 +908,11 @@ void ShowImage(const CMNISTData& data, size_t imageIndex)
     }
 }
 // Hàm tiền xử lý ảnh, bạn cần thay đổi cho phù hợp với dữ liệu đầu vào của mô hình
-std::vector<float> PreprocessImage(const std::string& imagePath) {
+vector<float> PreprocessImage(const  string& imagePath) {
     // Đọc ảnh từ đường dẫn
     cv::Mat image = cv::imread(imagePath, cv::IMREAD_GRAYSCALE);
     if (image.empty()) {
-        std::cerr << "Không thể đọc ảnh từ đường dẫn: " << imagePath << std::endl;
+        cerr << "Không thể đọc ảnh từ đường dẫn: " << imagePath << endl;
         return {};
     }
 
@@ -533,7 +920,7 @@ std::vector<float> PreprocessImage(const std::string& imagePath) {
     cv::resize(image, image, cv::Size(28, 28));
 
     // Chuyển đổi ma trận ảnh thành vector float
-    std::vector<float> input;
+    vector<float> input;
     input.reserve(image.rows * image.cols);
     for (int i = 0; i < image.rows; ++i) {
         for (int j = 0; j < image.cols; ++j) {
@@ -543,145 +930,159 @@ std::vector<float> PreprocessImage(const std::string& imagePath) {
 
     return input;
 }
-
 // Hàm dự đoán số từ ảnh đầu vào sử dụng mô hình neural network
-uint8_t Predict(const std::vector<float>& input) {
+uint8_t Predict(const  vector<float>& input) {
     // Sử dụng mô hình neural network đã được huấn luyện để dự đoán
     uint8_t predictedLabel = g_neuralNetwork.ForwardPass(input.data(), 0); // 0 là nhãn tùy ý vì đây là dự đoán
     return predictedLabel;
 }
-
-
 int main(int argc, char** argv)
 {
-    // load the MNIST data if we can
-    if (!g_trainingData.Load(true) || !g_testData.Load(false))
-    {
-        printf("Could not load mnist data, aborting!\n");
-        system("pause");
-        return 1;
-    }
-#if REPORT_ERROR_WHILE_TRAINING()
-    FILE* file = fopen("Error.csv", "w+t");
-    if (!file)
-    {
-        printf("Could not open Error.csv for writing, aborting!\n");
-        system("pause");
-        return 2;
-    }
-    fprintf(file, "\"Training Data Accuracy\",\"Testing Data Accuracy\"\n");
-#endif
-
-    {
-        SBlockTimer timer("Training Time:  ");
-
-        // train the network, reporting error before each training
-        for (size_t epoch = 0; epoch < c_trainingEpochs; ++epoch)
-        {
-#if REPORT_ERROR_WHILE_TRAINING()
-            float accuracyTraining = GetDataAccuracy(g_trainingData);
-            float accuracyTest = GetDataAccuracy(g_testData);
-            printf("Training Data Accuracy: %0.2f%%\n", 100.0f * accuracyTraining);
-            printf("Test Data Accuracy: %0.2f%%\n\n", 100.0f * accuracyTest);
-            fprintf(file, "\"%f\",\"%f\"\n", accuracyTraining, accuracyTest);
-#endif
-
-            printf("Training epoch %zu / %zu...\n", epoch + 1, c_trainingEpochs);
-            g_neuralNetwork.Train(g_trainingData, c_miniBatchSize, c_learningRate);
-            printf("\n");
+    int i;
+    printf("Kernel: \n");
+    printf("Kernel 0: Load mnist by host \n");
+    printf("Kernel 1: Load mnist by device \n");
+    printf("Kernel 2: Load mnist by SMEM \n");
+    printf("Kernel 3: Load mnist by CMEM \n");
+    printf("Kernel 4: Compare host and kernel \n");
+    scanf("Click on sceen: %d" ,&i);
+    GpuTimer timer;
+    float time, time1, time2, time3;
+    switch (i) {
+    case 0:
+        timer.Start();
+        printf("Load MNIST on Host \n");
+        if (!g_trainingData.Load(true) || !g_testData.Load(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
         }
+        timer.Stop();
+        time = timer.Elapsed();
+        printf("Host time: %f ms\n", time);
+        break;
+    case 1:
+        timer.Start();
+        printf("Kernel 1: Load MNIST on Device \n");
+        if (!g_trainingData.Loadkernel1(true) || !g_testData.Loadkernel1(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
+        }
+        timer.Stop();
+        time = timer.Elapsed();
+        printf("Kernel 1 time: %f ms\n", time);
+        break;
+    case 2:
+        timer.Start();
+        printf("Kernel 2: Load MNIST on Device by SMEM \n");
+        if (!g_trainingData.Loadkernel2(true) || !g_testData.Loadkernel2(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
+        }
+        timer.Stop();
+        time = timer.Elapsed();
+        printf("Kernel 2 time: %f ms\n", time);
+        break;
+    case 3:
+        timer.Start();
+        printf("Kernel 3: Load MNIST on Device by CMEM \n");
+        if (!g_trainingData.Loadkernel3(true) || !g_testData.Loadkernel3(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
+        }
+        timer.Stop();
+        time = timer.Elapsed();
+        printf("Kernel 3 time: %f ms\n", time);
+        break;
+    case 4:
+        timer.Start();
+        printf("Load MNIST on Host\n");
+        if (!g_trainingData.Load(true) || !g_testData.Load(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
+        }
+        timer.Stop();
+        time = timer.Elapsed();
+        timer.Start();
+        printf("Kernel 1: Load MNIST on Device\n");
+        if (!g_trainingData.Loadkernel1(true) || !g_testData.Loadkernel1(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
+        }
+        timer.Stop();
+        time1 = timer.Elapsed();
+       
+        //
+        timer.Start();
+        printf("Kernel 2: Load MNIST on Device by SMEM \n");
+        if (!g_trainingData.Loadkernel2(true) || !g_testData.Loadkernel2(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
+        }
+        timer.Stop();
+        time2 = timer.Elapsed();
+      
+        //
+        timer.Start();
+        printf("Kernel 3: Load MNIST on Device by CMEM \n");
+        if (!g_trainingData.Loadkernel3(true) || !g_testData.Loadkernel3(false)) {
+            printf("Could not load mnist data, aborting!\n");
+            system("pause");
+            return 1;
+        }
+        timer.Stop();
+        time3 = timer.Elapsed();
+       
+        printf("Host time: %f ms\n", time);
+        printf("Kernel 1 time: %f ms\n", time1);
+        printf("Kernel 2 time: %f ms\n", time2);
+        printf("Kernel 3 time: %f ms\n", time3);
+        break;
+    default:
+        printf("Invalid case!\n");
+        break;
     }
 
-    // report final error
+    printf("\n \n CNeuralNetwork is training!!!\n");
+    // huấn luyện mạng, báo lỗi trước mỗi lần huấn luyện
+    for (size_t epoch = 0; epoch < c_trainingEpochs; ++epoch)
+    {
+        printf("Training epoch %zu / %zu...\n", epoch + 1, c_trainingEpochs);
+        g_neuralNetwork.Train(g_trainingData, c_miniBatchSize, c_learningRate);
+        float accuracyTraining = GetDataAccuracy(g_trainingData);
+        float accuracyTest = GetDataAccuracy(g_testData);
+        printf("Training Data Accuracy: %0.2f%%\n", 100.0f * accuracyTraining);
+        printf("Test Data Accuracy: %0.2f%%\n\n", 100.0f * accuracyTest);
+    }
+
+
+    // Kết quả báo lỗi cuối cùng
     float accuracyTraining = GetDataAccuracy(g_trainingData);
     float accuracyTest = GetDataAccuracy(g_testData);
     printf("\nFinal Training Data Accuracy: %0.2f%%\n", 100.0f * accuracyTraining);
     printf("Final Test Data Accuracy: %0.2f%%\n\n", 100.0f * accuracyTest);
 
-#if REPORT_ERROR_WHILE_TRAINING()
-    fprintf(file, "\"%f\",\"%f\"\n", accuracyTraining, accuracyTest);
-    fclose(file);
-#endif
-
-    // Write out the final weights and biases as JSON for use in the web demo
-    {
-        FILE* file = fopen("WeightsBiasesJSON.txt", "w+t");
-        fprintf(file, "{\n");
-
-        // network structure
-        fprintf(file, "  \"InputNeurons\":%zu,\n", c_numInputNeurons);
-        fprintf(file, "  \"HiddenNeurons\":%zu,\n", c_numHiddenNeurons);
-        fprintf(file, "  \"OutputNeurons\":%zu,\n", c_numOutputNeurons);
-
-        // HiddenBiases
-        auto hiddenBiases = g_neuralNetwork.GetHiddenLayerBiases();
-        fprintf(file, "  \"HiddenBiases\" : [\n");
-        for (size_t i = 0; i < hiddenBiases.size(); ++i)
-        {
-            fprintf(file, "    %f", hiddenBiases[i]);
-            if (i < hiddenBiases.size() - 1)
-                fprintf(file, ",");
-            fprintf(file, "\n");
-        }
-        fprintf(file, "  ],\n");
-
-        // HiddenWeights
-        auto hiddenWeights = g_neuralNetwork.GetHiddenLayerWeights();
-        fprintf(file, "  \"HiddenWeights\" : [\n");
-        for (size_t i = 0; i < hiddenWeights.size(); ++i)
-        {
-            fprintf(file, "    %f", hiddenWeights[i]);
-            if (i < hiddenWeights.size() - 1)
-                fprintf(file, ",");
-            fprintf(file, "\n");
-        }
-        fprintf(file, "  ],\n");
-
-        // OutputBiases
-        auto outputBiases = g_neuralNetwork.GetOutputLayerBiases();
-        fprintf(file, "  \"OutputBiases\" : [\n");
-        for (size_t i = 0; i < outputBiases.size(); ++i)
-        {
-            fprintf(file, "    %f", outputBiases[i]);
-            if (i < outputBiases.size() - 1)
-                fprintf(file, ",");
-            fprintf(file, "\n");
-        }
-        fprintf(file, "  ],\n");
-
-        // OutputWeights
-        auto outputWeights = g_neuralNetwork.GetOutputLayerWeights();
-        fprintf(file, "  \"OutputWeights\" : [\n");
-        for (size_t i = 0; i < outputWeights.size(); ++i)
-        {
-            fprintf(file, "    %f", outputWeights[i]);
-            if (i < outputWeights.size() - 1)
-                fprintf(file, ",");
-            fprintf(file, "\n");
-        }
-        fprintf(file, "  ]\n");
-
-        // done
-        fprintf(file, "}\n");
-        fclose(file);
-    }
-    
-    // You can use the code like the below to visualize an image if you want to.
+    // Sử dụng đoạn mã như dưới đây để trực quan hóa hình ảnh nếu muốn.
     //ShowImage(g_testData, 9);
-     // Đường dẫn đến các bức ảnh mà bạn muốn dự đoán
-    std::vector<std::string> imagePaths = { "drawn_image.png" };
+
+    vector< string> imagePaths = { "a.png","b.png","c.png","d.png","e.png" };
 
     // Dự đoán trên từng bức ảnh
     for (const auto& imagePath : imagePaths) {
         // Tiền xử lý ảnh
-        std::vector<float> input = PreprocessImage(imagePath);
+        vector<float> input = PreprocessImage(imagePath);
 
         // Dự đoán số từ ảnh đầu vào
         uint8_t predictedLabel = Predict(input);
 
         // In ra kết quả dự đoán
-        std::cout << "Dự đoán của ảnh " << imagePath << " là: " << static_cast<int>(predictedLabel) << std::endl;
+        cout << "Predict image " << imagePath << " is: " << static_cast<int>(predictedLabel) << endl;
     }
-    system("pause");
     return 0;
 }
